@@ -1,0 +1,21 @@
+services:
+  app:
+    build: .
+    image: banking-app:local
+    container_name: working-memory-banking-app
+    restart: unless-stopped
+    labels:
+      com.kubarycz.working-memory.managed: "true"
+      com.kubarycz.working-memory.claim: banking-app
+      com.kubarycz.working-memory.title: "Banking App"
+    ports:
+      - "127.0.0.1:4174:4174"
+    environment:
+      DATABASE_PATH: /data/application.sqlite
+      ENABLE_HTTP: "true"
+      ENABLE_UI: "true"
+    volumes:
+      - app-data:/data
+volumes:
+  app-data:
+    name: working-memory-banking-app-data

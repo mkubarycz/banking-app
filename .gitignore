@@ -1,0 +1,8 @@
+node_modules/
+dist/
+data/
+.cruft.json
+*.sqlite
+*.sqlite-*
+.DS_Store
+coverage/
