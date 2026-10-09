@@ -39,6 +39,14 @@ test('serves a contract Working Memory can parse over Streamable HTTP', async ()
     assert.ok(tools.tools.some((tool) => tool.name === 'contract-discover'));
     assert.ok(tools.tools.some((tool) => tool.name === 'ledger-commit'));
     assert.ok(tools.tools.some((tool) => tool.name === 'ledger-discard'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'ledger-group-create'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-map'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-attach'));
+    assert.ok(tools.tools.some(
+      (tool) => tool.name === 'transaction-staging-create-ledger-entry',
+    ));
+    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-reconcile'));
+    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-discard'));
     const result = await client.callTool({
       name: 'contract-discover',
       arguments: {},
@@ -49,7 +57,11 @@ test('serves a contract Working Memory can parse over Streamable HTTP', async ()
     ));
     assert.ok(item && item.type === 'text');
     const contract = JSON.parse(item.text) as Record<string, unknown>;
-    assert.equal(contract.contractVersion, '1.0');
+    assert.equal(contract.contractVersion, '2.6');
+    assert.deepEqual(
+      (contract.resources as Array<{ kind: string }>).map((resource) => resource.kind),
+      ['Account', 'Category', 'LedgerEntryGroup', 'LedgerEntry', 'TransactionStaging'],
+    );
     assert.deepEqual(
       Object.keys(contract.envelope as Record<string, unknown>),
       ['kind', 'metadata', 'spec', 'status', 'relationships'],

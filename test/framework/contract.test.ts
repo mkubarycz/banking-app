@@ -10,13 +10,37 @@ test('publishes the approved envelope and Zod-derived app resource schemas', () 
     ['kind', 'metadata', 'spec', 'status', 'relationships'],
   );
   assert.equal(contract.application.dataOwnership, 'application');
-  const resource = contract.resources[0];
-  assert.ok(resource);
-  assert.equal(resource.kind, 'LedgerEntry');
-  assert.equal(resource.schema.spec.type, 'object');
-  assert.ok(resource.schema.spec.required?.includes('status'));
-  assert.ok(resource.schema.spec.required?.includes('revenue'));
-  assert.match(JSON.stringify(resource.schema.spec), /Exact signed decimal/);
-  assert.ok(resource.lifecycle.length > 0);
-  assert.ok(resource.effects.length > 0);
+  assert.deepEqual(
+    contract.resources.map((resource) => resource.kind),
+    ['Account', 'Category', 'LedgerEntryGroup', 'LedgerEntry', 'TransactionStaging'],
+  );
+  const ledgerEntry = contract.resources.find((resource) => resource.kind === 'LedgerEntry');
+  assert.ok(ledgerEntry);
+  assert.equal(ledgerEntry.schema.spec.type, 'object');
+  assert.ok(ledgerEntry.schema.spec.required?.includes('amount'));
+  assert.match(JSON.stringify(ledgerEntry.schema.spec), /Exact signed decimal/);
+  assert.deepEqual(ledgerEntry.relationships, [
+    { field: 'groupId', targetKind: 'LedgerEntryGroup', cardinality: 'one', required: true },
+    { field: 'fromAccountId', targetKind: 'Account', cardinality: 'one', required: true },
+    { field: 'toAccountId', targetKind: 'Account', cardinality: 'one', required: true },
+  ]);
+  assert.ok(ledgerEntry.lifecycle.length > 0);
+  assert.ok(ledgerEntry.effects.length > 0);
+
+  const group = contract.resources.find((resource) => resource.kind === 'LedgerEntryGroup');
+  assert.deepEqual(group?.relationships, [{
+    field: 'ledgerEntryIds',
+    targetKind: 'LedgerEntry',
+    cardinality: 'many',
+    required: true,
+  }]);
+  const account = contract.resources.find((resource) => resource.kind === 'Account');
+  assert.ok(account?.schema.status.required?.includes('balance'));
+  const staging = contract.resources.find((resource) => resource.kind === 'TransactionStaging');
+  assert.ok(staging?.schema.status.required?.includes('state'));
+  assert.deepEqual(staging?.relationships, [
+    { field: 'fromAccountId', targetKind: 'Account', cardinality: 'one' },
+    { field: 'toAccountId', targetKind: 'Account', cardinality: 'one' },
+    { field: 'ledgerEntryId', targetKind: 'LedgerEntry', cardinality: 'one' },
+  ]);
 });

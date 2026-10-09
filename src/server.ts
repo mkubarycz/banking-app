@@ -21,6 +21,10 @@ const service = new BankingResourceService(
   registry,
   new ResourceStore(process.env.DATABASE_PATH ?? './application.sqlite'),
 );
+if (process.env.TRANSACTION_IMPORT_PATH) {
+  const imported = service.importTransactions(process.env.TRANSACTION_IMPORT_PATH).result;
+  console.log(`Imported ${imported.length} new transaction staging rows.`);
+}
 const mcp = new McpAdapter(registry, service);
 
 createServer((req, res) => void handle(req, res))
@@ -60,8 +64,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (!/^\d{4}$/.test(year)) throw new Error('year must contain exactly four digits.');
       return json(res, 200, {
         transactionId,
-        result: summarizeLedger(service.query('LedgerEntry', undefined, transactionId).result, year),
+        result: summarizeLedger(service.query('LedgerEntryGroup', undefined, transactionId).result, year),
       }, transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/ledger/groups' && req.method === 'POST') {
+      const input = asObject(await readBody(req));
+      return json(res, 201, service.createGroup(
+        input.spec,
+        input.entries,
+        transactionId,
+        stringValue(input.actor),
+      ), transactionId);
     }
     if (httpEnabled && url.pathname === '/api/ledger/dirty' && req.method === 'GET') {
       return json(res, 200, service.dirty(transactionId), transactionId);
@@ -78,6 +91,53 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const input = asObject(await readBody(req));
       return json(res, 200, service.discard(
         stringArray(input.ids),
+        transactionId,
+        stringValue(input.actor),
+      ), transactionId);
+    }
+    const stagingMatch = url.pathname.match(
+      /^\/api\/transaction-staging\/([0-9a-f-]+)\/(attach|create-ledger-entry|map|reconcile|discard)$/,
+    );
+    if (httpEnabled && stagingMatch && req.method === 'POST') {
+      const input = asObject(await readBody(req));
+      const [, id, operation] = stagingMatch;
+      if (operation === 'create-ledger-entry') {
+        return json(res, 201, service.createLedgerEntryFromStaging(
+          id,
+          numberValue(input.expectedResourceVersion),
+          transactionId,
+          stringValue(input.actor),
+        ), transactionId);
+      }
+      if (operation === 'attach') {
+        return json(res, 200, service.attachStaging(
+          id,
+          requiredString(input.groupId, 'groupId'),
+          numberValue(input.expectedResourceVersion),
+          transactionId,
+          stringValue(input.actor),
+        ), transactionId);
+      }
+      if (operation === 'map') {
+        return json(res, 200, service.mapStaging(
+          id,
+          requiredString(input.ledgerEntryId, 'ledgerEntryId'),
+          numberValue(input.expectedResourceVersion),
+          transactionId,
+          stringValue(input.actor),
+        ), transactionId);
+      }
+      if (operation === 'reconcile') {
+        return json(res, 200, service.reconcileStaging(
+          id,
+          numberValue(input.expectedResourceVersion),
+          transactionId,
+          stringValue(input.actor),
+        ), transactionId);
+      }
+      return json(res, 200, service.discardStaging(
+        id,
+        numberValue(input.expectedResourceVersion),
         transactionId,
         stringValue(input.actor),
       ), transactionId);
@@ -172,6 +232,11 @@ function headerTransactionId(req: IncomingMessage): string | undefined {
 
 function booleanSetting(value: string | undefined, fallback: boolean): boolean {
   return value === undefined ? fallback : value === 'true';
+}
+
+function requiredString(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value) throw new Error(`${field} must be a non-empty string.`);
+  return value;
 }
 
 function json(

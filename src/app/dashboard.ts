@@ -3,52 +3,44 @@ import { cents, money } from './money.js';
 
 export interface DashboardGroup {
   status: string;
-  revenue: string;
-  expenses: string;
+  income: string;
+  expense: string;
   operatingCashFlow: string;
   activeEntryCount: number;
 }
 
 export function summarizeLedger(entries: ResourceEnvelope[], year: string) {
   const matching = entries.filter((entry) => reportingYear(entry) === year);
-  const grouped = new Map<string, { revenue: bigint; expenses: bigint; count: number }>();
+  const grouped = new Map<string, { income: bigint; expense: bigint; count: number }>();
   for (const entry of matching) {
     const status = String(entry.spec.status);
-    const group = grouped.get(status) ?? { revenue: 0n, expenses: 0n, count: 0 };
-    group.revenue += cents(String(entry.spec.revenue));
-    group.expenses += cents(String(entry.spec.expenses));
+    const group = grouped.get(status) ?? { income: 0n, expense: 0n, count: 0 };
+    group.income += cents(String(entry.status.income));
+    group.expense += cents(String(entry.status.expense));
     group.count += 1;
     grouped.set(status, group);
   }
   const groups: DashboardGroup[] = [...grouped].map(([status, values]) => ({
     status,
-    revenue: money(values.revenue),
-    expenses: money(values.expenses),
-    operatingCashFlow: money(values.revenue - values.expenses),
+    income: money(values.income),
+    expense: money(values.expense),
+    operatingCashFlow: money(values.income - values.expense),
     activeEntryCount: values.count,
   }));
-  const totalRevenue = groups.reduce((sum, group) => sum + cents(group.revenue), 0n);
-  const totalExpenses = groups.reduce((sum, group) => sum + cents(group.expenses), 0n);
+  const totalIncome = groups.reduce((sum, group) => sum + cents(group.income), 0n);
+  const totalExpense = groups.reduce((sum, group) => sum + cents(group.expense), 0n);
   return {
     year,
     groups,
     total: {
-      revenue: money(totalRevenue),
-      expenses: money(totalExpenses),
-      operatingCashFlow: money(totalRevenue - totalExpenses),
+      income: money(totalIncome),
+      expense: money(totalExpense),
+      operatingCashFlow: money(totalIncome - totalExpense),
       activeEntryCount: matching.length,
     },
   };
 }
 
 export function reportingYear(entry: ResourceEnvelope): string {
-  const source = entry.spec.source;
-  if (source && typeof source === 'object' && !Array.isArray(source)) {
-    const worksheet = (source as Record<string, unknown>).worksheet;
-    if (typeof worksheet === 'string') {
-      const match = worksheet.match(/^(\d{4}) Ledger$/);
-      if (match) return match[1];
-    }
-  }
   return String(entry.spec.date).slice(0, 4);
 }

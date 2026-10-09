@@ -14,6 +14,7 @@ services:
       DATABASE_PATH: /data/application.sqlite
       ENABLE_HTTP: "true"
       ENABLE_UI: "true"
+      TRANSACTION_IMPORT_PATH: /data/imports
     volumes:
       - app-data:/data
 volumes:
