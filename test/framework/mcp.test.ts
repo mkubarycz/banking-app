@@ -8,7 +8,7 @@ import { createRegistry } from '../../src/app/registry.js';
 import { ResourceStore } from '../../src/framework/store.js';
 import { McpAdapter } from '../../src/mcp.js';
 
-test('serves a contract Working Memory can parse over Streamable HTTP', async () => {
+test('serves the complete 1.2 contract and mutation tools over Streamable HTTP', async () => {
   const registry = createRegistry();
   const store = new ResourceStore(':memory:');
   const adapter = new McpAdapter(registry, new BankingResourceService(registry, store));
@@ -16,14 +16,14 @@ test('serves a contract Working Memory can parse over Streamable HTTP', async ()
     void (async () => {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
-      const body = chunks.length
-        ? JSON.parse(Buffer.concat(chunks).toString('utf8'))
-        : undefined;
-      await adapter.handle(req, res, body);
+      await adapter.handle(
+        req,
+        res,
+        chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : undefined,
+      );
     })();
   });
   const client = new Client({ name: 'banking-mcp-test', version: '1.0.0' });
-
   try {
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject);
@@ -34,37 +34,33 @@ test('serves a contract Working Memory can parse over Streamable HTTP', async ()
     await client.connect(new StreamableHTTPClientTransport(
       new URL(`http://127.0.0.1:${address.port}/mcp`),
     ));
-
     const tools = await client.listTools();
-    assert.ok(tools.tools.some((tool) => tool.name === 'contract-discover'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'ledger-commit'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'ledger-discard'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'ledger-group-create'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-map'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-attach'));
-    assert.ok(tools.tools.some(
-      (tool) => tool.name === 'transaction-staging-create-ledger-entry',
-    ));
-    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-reconcile'));
-    assert.ok(tools.tools.some((tool) => tool.name === 'transaction-staging-discard'));
-    const result = await client.callTool({
-      name: 'contract-discover',
-      arguments: {},
-    });
-    const content = Array.isArray(result.content) ? result.content : [];
-    const item = content.find((candidate) => (
-      candidate.type === 'text' && typeof candidate.text === 'string'
-    ));
-    assert.ok(item && item.type === 'text');
-    const contract = JSON.parse(item.text) as Record<string, unknown>;
-    assert.equal(contract.contractVersion, '2.6');
-    assert.deepEqual(
-      (contract.resources as Array<{ kind: string }>).map((resource) => resource.kind),
-      ['Account', 'Category', 'LedgerEntryGroup', 'LedgerEntry', 'TransactionStaging'],
+    const names = tools.tools.map((tool) => tool.name);
+    for (const required of [
+      'contract-discover',
+      'resource-query',
+      'pending-changes-query',
+      'account-order-query',
+      'account-order-update',
+      'resource-create',
+      'change-set-create',
+      'change-set-commit',
+      'change-set-discard',
+      'application-reset',
+    ]) assert.ok(names.includes(required), `missing ${required}`);
+    const result = await client.callTool({ name: 'contract-discover', arguments: {} });
+    const item = (Array.isArray(result.content) ? result.content : []).find(
+      (candidate) => candidate.type === 'text',
     );
+    assert.ok(item && item.type === 'text');
+    const contract = JSON.parse(item.text) as {
+      contractVersion: string;
+      resources: Array<{ kind: string }>;
+    };
+    assert.equal(contract.contractVersion, '3.0');
     assert.deepEqual(
-      Object.keys(contract.envelope as Record<string, unknown>),
-      ['kind', 'metadata', 'spec', 'status', 'relationships'],
+      contract.resources.map((resource) => resource.kind),
+      ['Account', 'Budget', 'Transaction', 'AccountKnownValue', 'ChangeSet'],
     );
   } finally {
     await client.close().catch(() => undefined);

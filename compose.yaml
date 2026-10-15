@@ -20,3 +20,4 @@ services:
 volumes:
   app-data:
     name: working-memory-banking-app-data
+    external: true

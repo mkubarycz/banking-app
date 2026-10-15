@@ -3,44 +3,33 @@ import test from 'node:test';
 import { createRegistry } from '../../src/app/registry.js';
 import { applicationContract } from '../../src/contract.js';
 
-test('publishes the approved envelope and Zod-derived app resource schemas', () => {
+test('publishes the 1.2 resource and operation contract', () => {
   const contract = applicationContract(createRegistry());
+  assert.equal(contract.contractVersion, '3.0');
   assert.deepEqual(
     Object.keys(contract.envelope),
     ['kind', 'metadata', 'spec', 'status', 'relationships'],
   );
-  assert.equal(contract.application.dataOwnership, 'application');
   assert.deepEqual(
     contract.resources.map((resource) => resource.kind),
-    ['Account', 'Category', 'LedgerEntryGroup', 'LedgerEntry', 'TransactionStaging'],
+    ['Account', 'Budget', 'Transaction', 'AccountKnownValue', 'ChangeSet'],
   );
-  const ledgerEntry = contract.resources.find((resource) => resource.kind === 'LedgerEntry');
-  assert.ok(ledgerEntry);
-  assert.equal(ledgerEntry.schema.spec.type, 'object');
-  assert.ok(ledgerEntry.schema.spec.required?.includes('amount'));
-  assert.match(JSON.stringify(ledgerEntry.schema.spec), /Exact signed decimal/);
-  assert.deepEqual(ledgerEntry.relationships, [
-    { field: 'groupId', targetKind: 'LedgerEntryGroup', cardinality: 'one', required: true },
+  const transaction = contract.resources.find((resource) => resource.kind === 'Transaction');
+  assert.ok(transaction?.schema.spec.required?.includes('amount'));
+  assert.deepEqual(transaction?.relationships, [
     { field: 'fromAccountId', targetKind: 'Account', cardinality: 'one', required: true },
     { field: 'toAccountId', targetKind: 'Account', cardinality: 'one', required: true },
+    { field: 'budgetId', targetKind: 'Budget', cardinality: 'one', required: true },
+    { field: 'changeSetId', targetKind: 'ChangeSet', cardinality: 'one' },
   ]);
-  assert.ok(ledgerEntry.lifecycle.length > 0);
-  assert.ok(ledgerEntry.effects.length > 0);
-
-  const group = contract.resources.find((resource) => resource.kind === 'LedgerEntryGroup');
-  assert.deepEqual(group?.relationships, [{
-    field: 'ledgerEntryIds',
-    targetKind: 'LedgerEntry',
-    cardinality: 'many',
-    required: true,
-  }]);
   const account = contract.resources.find((resource) => resource.kind === 'Account');
-  assert.ok(account?.schema.status.required?.includes('balance'));
-  const staging = contract.resources.find((resource) => resource.kind === 'TransactionStaging');
-  assert.ok(staging?.schema.status.required?.includes('state'));
-  assert.deepEqual(staging?.relationships, [
-    { field: 'fromAccountId', targetKind: 'Account', cardinality: 'one' },
-    { field: 'toAccountId', targetKind: 'Account', cardinality: 'one' },
-    { field: 'ledgerEntryId', targetKind: 'LedgerEntry', cardinality: 'one' },
-  ]);
+  assert.ok(account?.schema.status.required?.includes('directBalance'));
+  assert.ok(account?.schema.status.required?.includes('descendantsBalance'));
+  const budget = contract.resources.find((resource) => resource.kind === 'Budget');
+  assert.ok(budget?.schema.status.required?.includes('budgeted'));
+  assert.ok(budget?.schema.status.required?.includes('balance'));
+  assert.ok(budget?.schema.status.required?.includes('balanceByMonth'));
+  assert.ok(budget?.schema.spec.required?.includes('amount'));
+  assert.ok(contract.application.capabilities.includes('atomic-change-sets'));
+  assert.match(contract.operations.changeVersion, /change-version/);
 });

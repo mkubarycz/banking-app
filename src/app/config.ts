@@ -1,9 +1,9 @@
 export const appConfig = {
   id: 'banking-app',
   title: 'Banking App',
-  description: 'A durable personal ledger with exact balances and budget pacing.',
-  version: '0.8.0',
-  contractVersion: '2.6',
+  description: 'A staged monthly financial ledger with account and budget hierarchies.',
+  version: '1.2.0',
+  contractVersion: '3.0',
   port: 4174,
   defaultHttpEnabled: true,
   defaultUiEnabled: true,

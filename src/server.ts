@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { createRequire } from 'node:module';
 import { appConfig } from './app/config.js';
 import { BankingResourceService } from './app/banking-service.js';
-import { summarizeLedger } from './app/dashboard.js';
+import { summarizeTransactions } from './app/dashboard.js';
 import { createRegistry } from './app/registry.js';
 import { bankingUi } from './app/ui.js';
 import { applicationContract } from './contract.js';
@@ -23,7 +23,7 @@ const service = new BankingResourceService(
 );
 if (process.env.TRANSACTION_IMPORT_PATH) {
   const imported = service.importTransactions(process.env.TRANSACTION_IMPORT_PATH).result;
-  console.log(`Imported ${imported.length} new transaction staging rows.`);
+  console.log(`Imported ${imported.length} new transactions.`);
 }
 const mcp = new McpAdapter(registry, service);
 
@@ -64,83 +64,79 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (!/^\d{4}$/.test(year)) throw new Error('year must contain exactly four digits.');
       return json(res, 200, {
         transactionId,
-        result: summarizeLedger(service.query('LedgerEntryGroup', undefined, transactionId).result, year),
+        result: summarizeTransactions(service.query('Transaction', undefined, transactionId).result, year),
       }, transactionId);
     }
-    if (httpEnabled && url.pathname === '/api/ledger/groups' && req.method === 'POST') {
+    if (httpEnabled && url.pathname === '/api/pending-changes' && req.method === 'GET') {
+      return json(res, 200, service.pendingChanges(transactionId), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/account-order' && req.method === 'GET') {
+      return json(res, 200, service.accountOrder(transactionId), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/account-order' && req.method === 'PUT') {
       const input = asObject(await readBody(req));
-      return json(res, 201, service.createGroup(
-        input.spec,
-        input.entries,
+      if (!Array.isArray(input.updates)) throw new Error('updates must be an array.');
+      const updates = input.updates.map((value) => {
+        const item = asObject(value);
+        return {
+          accountId: requiredString(item.accountId, 'accountId'),
+          order: nonNegativeInteger(item.order, 'order'),
+        };
+      });
+      return json(res, 200, service.updateAccountOrder({
+        updates,
+        transactionId,
+        actor: optionalStringField(input, 'actor'),
+      }), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/change-sets' && req.method === 'POST') {
+      const input = asObject(await readBody(req));
+      return json(res, 201, service.createChangeSet(
+        requiredString(input.title, 'title'),
+        stringValue(input.note),
         transactionId,
         stringValue(input.actor),
       ), transactionId);
     }
-    if (httpEnabled && url.pathname === '/api/ledger/dirty' && req.method === 'GET') {
-      return json(res, 200, service.dirty(transactionId), transactionId);
-    }
-    if (httpEnabled && url.pathname === '/api/ledger/commit' && req.method === 'POST') {
-      const input = asObject(await readBody(req));
-      return json(res, 200, service.commit(
-        stringArray(input.ids),
-        transactionId,
-        stringValue(input.actor),
-      ), transactionId);
-    }
-    if (httpEnabled && url.pathname === '/api/ledger/discard' && req.method === 'POST') {
-      const input = asObject(await readBody(req));
-      return json(res, 200, service.discard(
-        stringArray(input.ids),
-        transactionId,
-        stringValue(input.actor),
-      ), transactionId);
-    }
-    const stagingMatch = url.pathname.match(
-      /^\/api\/transaction-staging\/([0-9a-f-]+)\/(attach|create-ledger-entry|map|reconcile|discard)$/,
+    const changeSetMatch = url.pathname.match(
+      /^\/api\/change-sets\/([0-9a-f-]+)\/(commit|discard)$/,
     );
-    if (httpEnabled && stagingMatch && req.method === 'POST') {
+    if (httpEnabled && changeSetMatch && req.method === 'POST') {
       const input = asObject(await readBody(req));
-      const [, id, operation] = stagingMatch;
-      if (operation === 'create-ledger-entry') {
-        return json(res, 201, service.createLedgerEntryFromStaging(
-          id,
-          numberValue(input.expectedResourceVersion),
-          transactionId,
-          stringValue(input.actor),
-        ), transactionId);
-      }
-      if (operation === 'attach') {
-        return json(res, 200, service.attachStaging(
-          id,
-          requiredString(input.groupId, 'groupId'),
-          numberValue(input.expectedResourceVersion),
-          transactionId,
-          stringValue(input.actor),
-        ), transactionId);
-      }
-      if (operation === 'map') {
-        return json(res, 200, service.mapStaging(
-          id,
-          requiredString(input.ledgerEntryId, 'ledgerEntryId'),
-          numberValue(input.expectedResourceVersion),
-          transactionId,
-          stringValue(input.actor),
-        ), transactionId);
-      }
-      if (operation === 'reconcile') {
-        return json(res, 200, service.reconcileStaging(
-          id,
-          numberValue(input.expectedResourceVersion),
-          transactionId,
-          stringValue(input.actor),
-        ), transactionId);
-      }
-      return json(res, 200, service.discardStaging(
+      const [, id, operation] = changeSetMatch;
+      const method = operation === 'commit'
+        ? service.commitChangeSet.bind(service)
+        : service.discardChangeSet.bind(service);
+      return json(res, 200, method(
         id,
         numberValue(input.expectedResourceVersion),
         transactionId,
         stringValue(input.actor),
       ), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/reset' && req.method === 'POST') {
+      return json(res, 200, service.reset(transactionId), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/reimport' && req.method === 'POST') {
+      const directory = process.env.TRANSACTION_IMPORT_PATH;
+      if (!directory) throw new Error('TRANSACTION_IMPORT_PATH is not configured.');
+      const input = asObject(await readBody(req));
+      if (input.reset === true) service.reset(transactionId);
+      return json(res, 200, service.importTransactions(
+        directory,
+        transactionId,
+        stringValue(input.actor) ?? 'transaction-import',
+        true,
+      ), transactionId);
+    }
+    if (httpEnabled && url.pathname === '/api/change-version' && req.method === 'GET') {
+      const row = service.store.database.prepare(
+        'SELECT COUNT(*) AS version FROM domain_events',
+      ).get() as { version: number };
+      return json(res, 200, {
+        transactionId,
+        result: { version: Number(row.version) },
+      }, transactionId);
     }
     if (httpEnabled && url.pathname.startsWith('/api/resources/')) {
       return handleResource(req, res, url, transactionId);
@@ -269,9 +265,39 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+function optionalStringField(
+  input: Record<string, unknown>,
+  field: string,
+): string | undefined {
+  const value = input[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`${field} must be a string.`);
+  return value;
+}
+
+function optionalEnumField<const T extends string>(
+  input: Record<string, unknown>,
+  field: string,
+  values: readonly T[],
+): T | undefined {
+  const value = optionalStringField(input, field);
+  if (value === undefined) return undefined;
+  if (!values.includes(value as T)) {
+    throw new Error(`${field} must be one of: ${values.join(', ')}.`);
+  }
+  return value as T;
+}
+
 function numberValue(value: unknown): number {
   if (typeof value !== 'number') throw new Error('expectedResourceVersion must be a number.');
   return value;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isInteger(value) || Number(value) < 0) {
+    throw new Error(`${field} must be a non-negative integer.`);
+  }
+  return Number(value);
 }
 
 function stringArray(value: unknown): string[] {

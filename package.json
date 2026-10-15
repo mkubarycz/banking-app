@@ -1,7 +1,7 @@
 {
   "name": "banking-app",
-  "version": "0.8.0",
-  "description": "A durable personal ledger with exact balances and budget pacing.",
+  "version": "1.2.0",
+  "description": "A staged monthly financial ledger with account and budget hierarchies.",
   "private": true,
   "type": "module",
   "engines": {

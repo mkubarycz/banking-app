@@ -1,15 +1,15 @@
 import { ResourceRegistry } from '../framework/registry.js';
 import { accountResource } from './resources/account.js';
-import { categoryResource } from './resources/category.js';
-import { ledgerEntryGroupResource } from './resources/ledger-entry-group.js';
-import { ledgerEntryResource } from './resources/ledger-entry.js';
-import { transactionStagingResource } from './resources/transaction-staging.js';
+import { accountKnownValueResource } from './resources/account-known-value.js';
+import { budgetResource } from './resources/budget.js';
+import { changeSetResource } from './resources/change-set.js';
+import { transactionResource } from './resources/transaction.js';
 
 export function createRegistry(): ResourceRegistry {
   return new ResourceRegistry()
     .register(accountResource)
-    .register(categoryResource)
-    .register(ledgerEntryGroupResource)
-    .register(ledgerEntryResource)
-    .register(transactionStagingResource);
+    .register(budgetResource)
+    .register(transactionResource)
+    .register(accountKnownValueResource)
+    .register(changeSetResource);
 }

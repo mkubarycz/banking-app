@@ -1,14 +1,13 @@
 # Banking App
 
-A durable personal ledger with exact balances and budget pacing. This is an
-independent Cruft-managed application data plane: it owns SQLite persistence,
-resource schemas, audit/domain events, MCP and HTTP APIs, the dashboard,
-health, and its Docker image. Working Memory is an optional launcher and
-contract-first client.
+Banking App 1.2 is a transaction, planning, and account-reconciliation
+workspace. It owns its SQLite data, audit/domain events,
+HTTP API, MCP server, responsive web UI, and Docker image. Working Memory can
+launch it and manipulate the same contract through MCP.
 
-## Start and use
+## Run
 
-Local Node development (Node 22+):
+Node 22 or newer is required.
 
 ```sh
 npm ci
@@ -18,217 +17,242 @@ npm run build
 DATABASE_PATH=./banking-app.sqlite npm start
 ```
 
-Containerized:
+Container:
 
 ```sh
 docker compose build
 docker compose up -d
 curl http://127.0.0.1:4174/health
 open http://127.0.0.1:4174/
-docker compose down
 ```
 
-Compose publishes only `127.0.0.1:4174` and uses the named persistent volume
-`working-memory-banking-app-data`. The production database starts empty.
+Compose publishes only `127.0.0.1:4174` and stores SQLite data in the
+`working-memory-banking-app-data` volume.
 
-Endpoints:
+## Model
 
-- UI: `http://127.0.0.1:4174/`
-- health: `GET /health`
-- MCP Streamable HTTP: `/mcp`
-- discovery: `GET /.well-known/banking-app-contract` or `GET /api/contract`
-- resources: `GET|POST /api/resources/:kind` and
-  `GET|PUT|DELETE /api/resources/:kind/:id`, where `:kind` is `Account`,
-  `Category`, `LedgerEntryGroup`, `LedgerEntry`, or `TransactionStaging`
-- atomic group creation: `POST /api/ledger/groups` with a group `spec` and
-  non-empty `entries` array
-- dirty changes: `GET /api/ledger/dirty`
-- commit: `POST /api/ledger/commit` with `{ "ids": ["..."] }`
-- discard: `POST /api/ledger/discard` with `{ "ids": ["..."] }`
-- provisional staging mapping:
-  `POST /api/transaction-staging/:id/map`
-- attach as a new child entry:
-  `POST /api/transaction-staging/:id/attach`
-- create a new group and child entry:
-  `POST /api/transaction-staging/:id/create-ledger-entry`
-- verify and reconcile:
-  `POST /api/transaction-staging/:id/reconcile`
-- discard staging changes:
-  `POST /api/transaction-staging/:id/discard`
-- soft delete an unmapped staged transaction:
-  `DELETE /api/resources/TransactionStaging/:id`
-- dashboard: `GET /api/dashboard?year=2026`
-
-Send `x-transaction-id: <uuid>` over HTTP or `transactionId` through MCP to
-correlate writes. Updates and deletes require `expectedResourceVersion`.
-
-Mapping staging to an existing child entry immediately updates that entry's
-From account, To account, and amount, then marks its group dirty. Reconciliation
-later verifies the staged values and commits the group.
-
-Committing a dirty ledger group with its check-mark action reconciles every
-provisional staging row linked to its children, applies their exact values,
-marks the staging rows Reconciled, changes the group status to Realized, and
-commits the entire group atomically.
-
-## Grouped ledger model
-
-The generic envelope is `{ kind, metadata, spec, status, relationships }`.
-`metadata.id` is an application-generated stable UUID.
-
-`LedgerEntryGroup` is the visible, chronological ledger row. Its aggregate
-money fields are derived from its child ledger entries and account categories:
+Every resource uses:
 
 ```json
 {
-  "kind": "LedgerEntryGroup",
-  "spec": {
-    "status": "Realized",
-    "description": "Office purchase",
-    "date": "2026-01-15",
-    "note": "Optional"
+  "kind": "Transaction",
+  "metadata": {
+    "id": "uuid",
+    "createdAt": "ISO-8601",
+    "updatedAt": "ISO-8601",
+    "resourceVersion": 1
   },
-  "status": {
-    "income": "0.00",
-    "expense": "400.00",
-    "transfers": "0.00",
-    "cashDelta": "-400.00",
-    "operatingCashFlow": "-400.00",
-    "cashOnHand": "-400.00",
-    "dirty": true,
-    "committedAt": null,
-    "deleted": false,
-    "previousSpec": null
-  },
-  "relationships": {
-    "ledgerEntryIds": ["40a09ac6-609e-4753-b8c8-577ade524825"]
-  }
+  "spec": {},
+  "status": {},
+  "relationships": {}
 }
 ```
 
-A child `LedgerEntry` is one transfer from one account to another:
+The registered resource kinds are:
 
-```json
-{
-  "kind": "LedgerEntry",
-  "spec": { "amount": "400.00" },
-  "relationships": {
-    "groupId": "f805a53a-cbec-401f-a8bf-a48234935f43",
-    "fromAccountId": "00000000-0000-4000-8000-000000000101",
-    "toAccountId": "00000000-0000-4000-8000-000000000103"
-  }
-}
-```
+- **Account** — a node in a user-controlled hierarchy. Both parents and leaves
+  may receive transactions. Responses derive `directBalance`,
+  `descendantsBalance`, and `totalBalance`.
+- **Budget** — a separate planning hierarchy with one Budgeted Value per
+  occurrence plus an Income, Expense, or Reinvested flow. Calendar recurrence
+  uses RFC 5545-style rules: monthly day lists (including `-1` for the last day)
+  or `FREQ=WEEKLY;INTERVAL=2` behavior anchored by a first occurrence. The app
+  derives monthly Budgeted totals over the selected start/end dates and rolls
+  them through parent Budgets alongside Realized transaction totals. Derived
+  `balance` and cumulative `balanceByMonth` values represent disbursements
+  minus assigned Transactions.
+- **Transaction** — one date, description, positive amount, From account, To
+  account, and Budget. There are no split transactions or persisted groups.
+- **AccountKnownValue** — a dated observation of one account's balance. A leaf
+  observation anchors its direct balance; a parent observation reconciles its
+  direct activity together with all descendant balances.
+  Account-detail add, correction, and deletion controls stage an atomic Change
+  Set. Pending observations appear in the timeline with the standard red
+  commit bar; double-clicking only that bar commits them.
+- **ChangeSet** — an atomic unit of staged creates, updates, deletes, imports,
+  and reconciliation proposals.
 
-Money is a canonical decimal string with exactly two fractional digits and is
-stored as integer cents. JSON numeric money is rejected. A group always retains
-at least one child entry.
+Money is represented as a canonical decimal string with exactly two
+fractional digits and persisted/calculated as integer cents.
 
-## Accounts and categories
+### Classification
 
-Every account references one category for organization. Category `classification` is one of
-`Asset`, `AccountsReceivable`, `AccountsPayable`, `InvestmentAsset`,
-`Retirement`, or `Other`.
-Accounting boundaries are configured independently on each account with
-`spec.internal`. External-to-internal movement is income, internal-to-external
-movement is expense, and internal-to-internal or external-to-external movement
-is a transfer. Transfer amounts are displayed slightly smaller and italicized.
+Only the Account `internal` boundary has accounting semantics:
 
-Account responses publish a derived `status.balance`. The Cash balance includes
-the imported opening cash value and all active chronological child transfers,
-so it matches the latest ledger group’s `cashOnHand`.
+- External → Internal: Income
+- Internal → External: Expense
+- Internal → Internal: Transfer
+- External → External: Transfer
 
-The application seeds:
+### Known values and reconciliation
 
-- Cash
-- Misc Accounts Receivable
-- Misc Accounts Payable
-- Misc Retirement Account
-- Investment Assets category
+A committed leaf known value anchors its selected account's direct balance.
+For a parent Account, the calculated value includes direct activity plus every
+descendant Account, and the anchor applies to that combined total.
+The application calculates forward from the latest anchor using committed
+transactions. At each known value it publishes:
 
-The Accounts tab provides an edit dialog for changing an account title,
-category/type, internal-account checkbox, currency, institution, and note.
+- observed value
+- calculated pre-adjustment value
+- virtual unreconciled amount
+- severity (`High` when the absolute unreconciled amount is at least $1,000)
 
-Existing aggregate ledger rows are migrated in place into groups with child
-entries using these defaults. For example, a legacy `$400.00` expense becomes
-`Cash -> Misc Accounts Payable` for `$400.00`.
+The unreconciled amount is display-only and is never persisted as a
+transaction. It appears directly on the Accounts hierarchy; `$0.00` is green,
+and clicking any amount opens the underlying known value.
+Parent account totals combine each account's anchored/calculated direct value
+with its descendants.
 
-Creates, edits, soft deletes, and restores are immediately visible working
-changes on their containing group. Commit acknowledges the group and its child
-entries atomically. Revert restores both group metadata and the committed child
-entry set. Discover `/api/contract` or MCP `contract-discover` for authoritative
-schemas.
+### Change Sets
 
-Ledger-group and child-entry cells use click-to-edit, blur-to-save inline
-editing. Computed aggregate cells are shaded as read-only. Autosaved changes
-mark the containing group dirty for Commit/Revert. Account and category cards
-provide management controls. Expanded groups can add or delete child entries;
-the final child cannot be deleted.
+Single resource mutations automatically create their own Change Set. For an
+atomic multi-resource operation, create one Change Set first and include its ID
+as `relationships.changeSetId` on every grouped create or update. Omitting that
+relationship creates a separate Change Set. Agents must not commit or discard a
+Change Set unless the user explicitly requests that lifecycle operation; normal
+work leaves correct changes staged for UI approval.
 
-## Transaction staging and reconciliation
+Interactive resource mutations are staged. Account display ordering and
+deterministic source imports apply immediately. The default staged lifecycle is:
 
-Compose reads Merrill activity CSV files from `/data/imports` in the
-application's persistent volume. Copy files from the repository's ignored
-`data/` directory into that location before restarting the container. Local
-Node runs can instead set `TRANSACTION_IMPORT_PATH` directly to the source
-directory. Imports are idempotent, and transactions on or before the latest
-realized or recognized ledger date are skipped. Zero-dollar transactions are
-ignored before source accounts or staging rows are created; previously imported
-unmapped zero-dollar rows are retired on startup. Each distinct source account
-creates a stable account resource, and imported transaction money is
-represented as a non-negative amount with its source account placed on the
-appropriate side of the transfer.
+`Open → Committed` or `Open → Discarded`
 
-An explicit historical import may bypass the realized-date cutoff for a
-controlled batch. Startup imports always retain the cutoff.
+Open Change Sets are prospective: their effective draft resource values drive
+Account balances, unreconciled amounts, ledger projections, dashboards, and
+Realized Budget totals until the Change Set is committed or discarded. Staging
+a metadata-only Transaction edit such as a Budget assignment must never remove
+that Transaction from financial calculations.
 
-The importer supports Merrill activity exports and Bank of America aggregate
-exports. Merrill rows in aggregate exports are excluded to prevent duplication
-with the dedicated Merrill source files.
+Commit validates and applies every item atomically. Discard removes newly
+created resources and restores the first baseline of updated/deleted resources.
+Every write also produces audit and domain events. Updates and deletes require
+`expectedResourceVersion` compare-and-swap protection.
 
-Imported `TransactionStaging` rows begin clean with status `Unmapped`. They
-appear in the right-hand rail with From, To, Amount, Ledger ID, and Status.
-Select a staging row, expand a ledger group, and use the link icon on a child
-entry to create a dirty `Provisional` mapping. Selecting a provisionally mapped
-row expands, scrolls to, and highlights its ledger entry.
+## Import and reimport
 
-When the transaction needs its own child entry, use **Attach selected
-transaction** on the target ledger group. The application atomically creates
-the child entry from the staging From, To, and Amount fields and makes the
-staging mapping provisional.
+Set `TRANSACTION_IMPORT_PATH` to a directory containing supported Merrill
+activity CSVs and Bank of America aggregate exports. Startup imports are
+idempotent. Zero-dollar rows are ignored, Merrill rows in aggregate exports
+are excluded, and source fingerprints remain stable.
 
-When no ledger group exists, use **Create ledger entry** directly on the
-staging card. It creates a new Realized group using the transaction date and
-description, adds the exact From → To child entry, and makes the mapping
-provisional for verification.
+Imported rows become committed native `Transaction` resources immediately.
+Each Transaction retains its source status, type, account, file, and stable
+fingerprint. Positive rows flow from external `Uncategorized Income` into the
+source account; negative rows flow from the source account to external
+`Uncategorized Expense`. All imported rows use the Uncategorized Budget until
+they are edited.
 
-Verify and reconcile requires concrete, distinct From and To accounts. The
-operation atomically applies the staging row's exact amount and account
-direction to the mapped child ledger entry, commits its containing group, and
-marks the staging row `Reconciled`. Reconciled rows remain available through
-the resource API but disappear from the rail. Dirty staging edits and mappings
-can be reverted to their last committed baseline.
+The 2026-10-11 account balance snapshot is loaded as committed
+`AccountKnownValue` resources. Snapshot accounts without transaction activity
+are still created; imported accounts without supplied balances remain
+unanchored.
 
-## Working Memory
-
-Working Memory registers the app as `@banking-app`, launches container
-`working-memory-banking-app`, and mounts independent volume
-`working-memory-banking-app-data`. Select Banking App in Container Apps or
-mention `@banking-app`; the chat agent discovers `contract-discover` before
-using generic resource tools.
-
-## Cruft updates and ownership
-
-Provenance is pinned in `.cruft.json` to Working Memory commit `9d37a29`,
-subdirectory `templates/standalone-app`. Framework/runtime surfaces remain
-template-owned. Banking domain definitions, policies, UI, and tests are
-app-owned under `src/app/**` and `test/app/**` and are the only skipped paths.
-
-From the Banking App directory:
+Banking App performs a one-time clean migration from the previous projection
+workspace. It removes the old Account, Transaction, Staged Transaction,
+projection, and Change Set data before rebuilding Accounts and Transactions
+from the current snapshot and source files. Use reset and reimport during
+development to reproduce the source-backed data:
 
 ```sh
-../working-memory/scripts/cruft.sh check
-../working-memory/scripts/cruft.sh update --template-path ../working-memory
+curl -X POST http://127.0.0.1:4174/api/reset
+curl -X POST -H 'content-type: application/json' \
+  -d '{"reset":false}' http://127.0.0.1:4174/api/reimport
 ```
 
-Review every update diff. Do not use `--skip-update` to hide framework drift.
+`/api/reimport` reads only the server-configured `TRANSACTION_IMPORT_PATH`.
+
+## HTTP and MCP
+
+Discovery:
+
+- `GET /health`
+- `GET /api/contract`
+- `GET /.well-known/banking-app-contract`
+- MCP Streamable HTTP at `/mcp`
+
+Resources:
+
+- `GET|POST /api/resources/:kind`
+- `GET|PUT|DELETE /api/resources/:kind/:id`
+
+Workflows:
+
+- `POST /api/change-sets`
+- `POST /api/change-sets/:id/commit`
+- `POST /api/change-sets/:id/discard`
+- `POST /api/reset`
+- `POST /api/reimport`
+- `GET /api/pending-changes` to list pending resources and fields changed from
+  their committed baselines
+- `GET|PUT /api/account-order` to read or immediately update Account sibling
+  display order without a Change Set
+- `GET /api/change-version`
+- `GET /api/dashboard?year=2026`
+
+MCP exposes equivalent resource, Change Set, reset, and import tools.
+Dragged Transaction references resolve through `resource-get` and change
+through `resource-update`. Call `contract-discover` before mutations. Supply
+`transactionId` through MCP or `x-transaction-id` over HTTP to correlate
+writes.
+
+`GET /api/change-version` is a lightweight host-integration signal. The web UI
+polls it and refreshes after MCP or API mutations.
+
+## UI
+
+The UI provides:
+
+- a month-grouped native Transaction list with date, description, source
+  provenance, route, classification, and amount
+- a consistent pending-change treatment across resource views: an 8px red left
+  bar identifies pending rows, red values identify fields that differ from
+  committed data, and double-clicking only the red bar commits the associated
+  atomic Change Set
+- draggable Transactions that emit Working Memory's versioned
+  Container App resource-reference JSON with date, description, amount, stable
+  app/resource identity, and a loopback deep link
+- drag-and-drop Account and Budget trees
+- immediate Account ordering stored separately from staged Account resources;
+  changing an Account parent remains an atomic Change Set edit
+- separate direct, descendant, and total Account balances
+- Account detail balance history with a dated timeline, pointer-centered
+  mouse-wheel zoom, double-click month zoom, reset, and synchronized
+  graph/Transaction highlighting
+- stacked balance-history area lines for parent Accounts, showing how direct and
+  child-account balances compose and carry the total forward over time, with
+  clickable transaction dots linked to activity rows
+- parent Account activity tables that include all descendant transactions and
+  virtual adjustments, prefixing routes with the participating child Account;
+  every Account in a route links to its Account detail page
+- draggable Account rows that emit the same versioned Working Memory resource
+  reference payload and deep link as draggable Transactions
+- Account-detail known-value add/edit dialogs, including deletion and virtual
+  adjustment notes that show the observed amount and date
+- perfect-reconciliation badges on the latest transaction at or before a
+  fully reconciled known value, with a green balance and direct access to the
+  known-value editor
+- a signed, clickable Unreconciled column on the Accounts hierarchy, with
+  green `$0.00` balances and observed/ledger/date details on hover
+- paste-friendly date fields that normalize common US, ISO, and month-name
+  dates to the canonical `YYYY-MM-DD` format before submission
+- calendar-derived monthly Budgeted and Realized Budget rollups
+- Account-style Budget detail pages with Back navigation, autosaved inline
+  recurrence editing, pending-change highlighting and Commit actions, and
+  descendant-aware Transaction tables
+- full-calendar-year Budget balance charts where recurrence disbursements add
+  funds, assigned Transactions subtract funds, and every dated event is a dot
+- a default five-day Settled balance view that nets short-lived disbursement
+  spikes while retaining a Raw balance toggle and both values in event tooltips
+- an explicit zero-balance reference line and future Estimated payment events
+  equal to each remaining scheduled Budget occurrence
+- Budget Transaction tables with the balance immediately after each row
+- shared Account/Budget timeline interactions: wheel zoom, month zoom on
+  double-click, reset controls, and transaction-dot hover/click highlighting
+- month-grouped Transaction views with the assigned Budget in the grid and a
+  title-click Transaction details popout for editing Date, Description, Amount,
+  From Account, To Account, and Budget
+- searchable account and budget mapping inputs
+- dated known-value entry and virtual unreconciled-amount review
+- an always-visible Change Set approval/discard rail
+
+Persisted transaction groups and Account Categories no longer exist.
