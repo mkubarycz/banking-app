@@ -139,7 +139,12 @@ export class ResourceStore {
     this.database.close();
   }
 
+  atomic<T>(operation: () => T): T {
+    return this.transaction(operation);
+  }
+
   private transaction<T>(operation: () => T): T {
+    if (this.database.isTransaction) return operation();
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const result = operation();

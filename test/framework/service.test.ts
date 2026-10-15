@@ -1,106 +1,71 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createRegistry } from '../../src/app/registry.js';
 import { BankingResourceService } from '../../src/app/banking-service.js';
+import { DEFAULT_IDS } from '../../src/app/ledger-store.js';
+import { createRegistry } from '../../src/app/registry.js';
 import { ResourceStore } from '../../src/framework/store.js';
 
-test('runs generic CRUD with compare-and-swap and transaction correlation', () => {
+test('commits and discards change sets atomically', () => {
   const store = new ResourceStore(':memory:');
   const service = new BankingResourceService(createRegistry(), store);
   try {
-    const transactionId = '11111111-1111-4111-8111-111111111111';
-    const created = service.create({
-      kind: 'LedgerEntry',
-      spec: {
-        status: 'Realized', description: 'First entry', date: '2026-01-01',
-        revenue: '1.00', expenses: '0.00', reinvested: '0.00',
+    const createSet = service.createChangeSet('Create transaction').result;
+    service.create({
+      kind: 'Transaction',
+      spec: { date: '2026-01-01', description: 'Expense', amount: '400.00' },
+      relationships: {
+        fromAccountId: DEFAULT_IDS.cashAccount,
+        toAccountId: DEFAULT_IDS.payableAccount,
+        budgetId: DEFAULT_IDS.uncategorizedBudget,
+        changeSetId: createSet.metadata.id,
       },
-      transactionId,
-      actor: 'test',
     });
-    assert.equal(created.transactionId, transactionId);
-    assert.equal(created.result.kind, 'LedgerEntry');
-    assert.equal(created.result.metadata.resourceVersion, 1);
-    assert.deepEqual(created.result.status, {
-      cashDelta: '1.00', operatingCashFlow: '1.00', cashOnHand: '1.00',
-      dirty: true, committedAt: null, deleted: false, previousSpec: null,
-    });
-    service.commit([created.result.metadata.id]);
+    assert.equal(service.get('ChangeSet', createSet.metadata.id).result.status.changeCount, 1);
+    service.commitChangeSet(createSet.metadata.id, createSet.metadata.resourceVersion);
+    const transaction = service.query('Transaction', undefined).result[0];
+    assert.equal(transaction.status.state, 'Committed');
+    assert.equal(service.get('Account', DEFAULT_IDS.cashAccount).result.status.directBalance, '-400.00');
 
-    const queried = service.query('LedgerEntry', { status: 'Realized' });
-    assert.equal(queried.result.length, 1);
-    assert.equal(queried.result[0].status.dirty, false);
-    assert.match(String(queried.result[0].status.committedAt), /^\d{4}-\d{2}-\d{2}T/);
+    const budgetSet = service.createChangeSet('Create mortgage budget').result;
+    const mortgage = service.create({
+      kind: 'Budget',
+      spec: { name: 'Mortgage', amount: '0.00' },
+      relationships: { changeSetId: budgetSet.metadata.id },
+    }).result;
+    service.commitChangeSet(budgetSet.metadata.id, budgetSet.metadata.resourceVersion);
 
     const updated = service.update({
-      kind: 'LedgerEntry',
-      id: created.result.metadata.id,
-      expectedResourceVersion: 1,
-      spec: {
-        status: 'Planned', description: 'Updated entry', date: '2026-01-01',
-        revenue: '2.00', expenses: '0.00', reinvested: '0.00',
-      },
-      status: created.result.status,
-      relationships: {},
-    });
-    assert.equal(updated.result.metadata.resourceVersion, 2);
-    assert.equal(updated.result.status.committedAt, null);
-    assert.throws(() => service.update({
-      kind: 'LedgerEntry',
-      id: created.result.metadata.id,
-      expectedResourceVersion: 1,
-      spec: updated.result.spec,
-      status: updated.result.status,
-      relationships: updated.result.relationships,
-    }), /conflict/);
+      kind: 'Transaction',
+      id: transaction.metadata.id,
+      expectedResourceVersion: transaction.metadata.resourceVersion,
+      spec: transaction.spec,
+      status: transaction.status,
+      relationships: { ...transaction.relationships, budgetId: mortgage.metadata.id },
+    }).result;
+    const updateSet = service.get('ChangeSet', String(updated.relationships.changeSetId)).result;
+    assert.equal(service.get('Account', DEFAULT_IDS.cashAccount).result.status.directBalance, '-400.00');
+    assert.equal(service.get('Budget', mortgage.metadata.id).result.status.realized, '400.00');
+    service.discardChangeSet(updateSet.metadata.id, updateSet.metadata.resourceVersion);
+    assert.equal(service.query('Transaction', undefined).result[0].spec.amount, '400.00');
+    assert.equal(service.get('Account', DEFAULT_IDS.cashAccount).result.status.directBalance, '-400.00');
   } finally {
     store.close();
   }
 });
 
-test('commits dirty history and retains soft-deleted rows atomically', () => {
+test('requires compare-and-swap resource versions', () => {
   const store = new ResourceStore(':memory:');
   const service = new BankingResourceService(createRegistry(), store);
   try {
-    const created = service.create({
-      kind: 'LedgerEntry',
-      spec: {
-        status: 'Estimated', description: 'Atomic entry', date: '2026-01-01',
-        revenue: '0.00', expenses: '1.00', reinvested: '0.00',
-      },
-      transactionId: '22222222-2222-4222-8222-222222222222',
-    });
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM ledger_entries').get()!.count, 1);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM audit_events').get()!.count, 1);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM domain_events').get()!.count, 1);
-    assert.equal(
-      store.database.prepare('SELECT transaction_id FROM audit_events').get()!.transaction_id,
-      created.transactionId,
-    );
-
-    service.commit([created.result.metadata.id]);
-    const clean = service.get('LedgerEntry', created.result.metadata.id).result;
-    assert.notEqual(clean.status.committedAt, null);
-    service.delete({
-      kind: 'LedgerEntry',
-      id: created.result.metadata.id,
-      expectedResourceVersion: clean.metadata.resourceVersion,
-    });
-    service.commit([created.result.metadata.id]);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM ledger_entries').get()!.count, 1);
-    assert.equal(store.database.prepare('SELECT deleted FROM ledger_entries').get()!.deleted, 1);
-    assert.equal(
-      store.database.prepare(
-        "SELECT count(*) AS count FROM pragma_table_info('ledger_entries') WHERE name = 'dirty'",
-      ).get()!.count,
-      0,
-    );
-    assert.equal(
-      store.database.prepare("SELECT count(*) AS count FROM data_change_log WHERE resolution = 'committed'").get()!.count,
-      2,
-    );
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM audit_events').get()!.count, 4);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM domain_events').get()!.count, 4);
+    const account = service.get('Account', DEFAULT_IDS.cashAccount).result;
+    assert.throws(() => service.update({
+      kind: 'Account',
+      id: account.metadata.id,
+      expectedResourceVersion: account.metadata.resourceVersion + 1,
+      spec: account.spec,
+      status: account.status,
+      relationships: account.relationships,
+    }), /version conflict/);
   } finally {
     store.close();
   }

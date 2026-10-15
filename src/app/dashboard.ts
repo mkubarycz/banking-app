@@ -2,53 +2,56 @@ import type { ResourceEnvelope } from '../framework/types.js';
 import { cents, money } from './money.js';
 
 export interface DashboardGroup {
-  status: string;
-  revenue: string;
-  expenses: string;
+  month: string;
+  income: string;
+  expense: string;
+  transfers: string;
   operatingCashFlow: string;
-  activeEntryCount: number;
+  transactionCount: number;
 }
 
-export function summarizeLedger(entries: ResourceEnvelope[], year: string) {
-  const matching = entries.filter((entry) => reportingYear(entry) === year);
-  const grouped = new Map<string, { revenue: bigint; expenses: bigint; count: number }>();
-  for (const entry of matching) {
-    const status = String(entry.spec.status);
-    const group = grouped.get(status) ?? { revenue: 0n, expenses: 0n, count: 0 };
-    group.revenue += cents(String(entry.spec.revenue));
-    group.expenses += cents(String(entry.spec.expenses));
+export function summarizeTransactions(transactions: ResourceEnvelope[], year: string) {
+  const matching = transactions.filter(
+    (transaction) => reportingYear(transaction) === year
+      && transaction.status.deleted !== true,
+  );
+  const grouped = new Map<string, {
+    income: bigint; expense: bigint; transfers: bigint; count: number;
+  }>();
+  for (const transaction of matching) {
+    const month = String(transaction.spec.date).slice(0, 7);
+    const group = grouped.get(month) ?? {
+      income: 0n, expense: 0n, transfers: 0n, count: 0,
+    };
+    const amount = cents(String(transaction.spec.amount));
+    if (transaction.status.classification === 'Income') group.income += amount;
+    else if (transaction.status.classification === 'Expense') group.expense += amount;
+    else group.transfers += amount;
     group.count += 1;
-    grouped.set(status, group);
+    grouped.set(month, group);
   }
-  const groups: DashboardGroup[] = [...grouped].map(([status, values]) => ({
-    status,
-    revenue: money(values.revenue),
-    expenses: money(values.expenses),
-    operatingCashFlow: money(values.revenue - values.expenses),
-    activeEntryCount: values.count,
+  const groups: DashboardGroup[] = [...grouped].sort().map(([month, values]) => ({
+    month,
+    income: money(values.income),
+    expense: money(values.expense),
+    transfers: money(values.transfers),
+    operatingCashFlow: money(values.income - values.expense),
+    transactionCount: values.count,
   }));
-  const totalRevenue = groups.reduce((sum, group) => sum + cents(group.revenue), 0n);
-  const totalExpenses = groups.reduce((sum, group) => sum + cents(group.expenses), 0n);
+  const totalIncome = groups.reduce((sum, group) => sum + cents(group.income), 0n);
+  const totalExpense = groups.reduce((sum, group) => sum + cents(group.expense), 0n);
   return {
     year,
     groups,
     total: {
-      revenue: money(totalRevenue),
-      expenses: money(totalExpenses),
-      operatingCashFlow: money(totalRevenue - totalExpenses),
-      activeEntryCount: matching.length,
+      income: money(totalIncome),
+      expense: money(totalExpense),
+      operatingCashFlow: money(totalIncome - totalExpense),
+      transactionCount: matching.length,
     },
   };
 }
 
 export function reportingYear(entry: ResourceEnvelope): string {
-  const source = entry.spec.source;
-  if (source && typeof source === 'object' && !Array.isArray(source)) {
-    const worksheet = (source as Record<string, unknown>).worksheet;
-    if (typeof worksheet === 'string') {
-      const match = worksheet.match(/^(\d{4}) Ledger$/);
-      if (match) return match[1];
-    }
-  }
   return String(entry.spec.date).slice(0, 4);
 }

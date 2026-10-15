@@ -1,235 +1,341 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { BankingResourceService } from '../../src/app/banking-service.js';
-import { summarizeLedger } from '../../src/app/dashboard.js';
+import { summarizeTransactions } from '../../src/app/dashboard.js';
+import { DEFAULT_IDS } from '../../src/app/ledger-store.js';
 import { cents, money } from '../../src/app/money.js';
 import { createRegistry } from '../../src/app/registry.js';
 import { ResourceStore } from '../../src/framework/store.js';
 
-function setup() {
-  const store = new ResourceStore(':memory:');
-  return { store, service: new BankingResourceService(createRegistry(), store) };
-}
-
-function spec(overrides: Record<string, unknown> = {}) {
-  return {
-    status: 'Realized',
-    description: 'Ledger row',
-    date: '2026-01-01',
-    revenue: '0.00',
-    expenses: '0.00',
-    reinvested: '0.00',
-    ...overrides,
-  };
-}
-
 test('uses exact cents and canonical decimal strings', () => {
   assert.equal(cents('9007199254740993.01'), 900719925474099301n);
   assert.equal(money(-12345n), '-123.45');
-  assert.throws(() => createRegistry().get('LedgerEntry').spec.parse(spec({ revenue: 0.1 })));
-  assert.throws(() => createRegistry().get('LedgerEntry').spec.parse(spec({ revenue: '0.1' })));
+  assert.throws(() => createRegistry().get('Transaction').spec.parse({
+    date: '2026-01-01',
+    description: 'Invalid',
+    amount: 0.1,
+  }));
 });
 
-test('uses timestamp order, calculated balances, dirty commits, and soft deletes', () => {
-  const { store, service } = setup();
+test('anchors direct account values and exposes virtual unreconciled amounts', () => {
+  const store = new ResourceStore(':memory:');
+  const service = new BankingResourceService(createRegistry(), store);
   try {
-    const opening = service.create({
-      kind: 'LedgerEntry',
-      spec: spec({
-        description: 'Opening',
-        date: '2025-12-31',
-        openingCashOnHand: '100.00',
-      }),
-    }).result;
-    const later = service.create({
-      kind: 'LedgerEntry',
-      spec: spec({ description: 'Later', revenue: '30.00', expenses: '4.00' }),
-    }).result;
-    const sameDay = service.create({
-      kind: 'LedgerEntry',
-      spec: spec({ description: 'Same day', expenses: '6.00' }),
-    }).result;
-
-    assert.deepEqual(
-      service.query('LedgerEntry', undefined).result.map((entry) => entry.spec.description),
-      ['Opening', 'Later', 'Same day'],
-    );
-    assert.equal(service.get('LedgerEntry', later.metadata.id).result.status.cashOnHand, '126.00');
-    assert.equal(service.get('LedgerEntry', sameDay.metadata.id).result.status.cashOnHand, '120.00');
-    service.commit([opening.metadata.id, later.metadata.id, sameDay.metadata.id]);
-    const firstCommittedAt = store.database.prepare(
-      'SELECT committed_at FROM ledger_entries WHERE id = ?',
-    ).get(sameDay.metadata.id)!.committed_at;
-    assert.equal(typeof firstCommittedAt, 'number');
-
-    const moved = service.update({
-      kind: 'LedgerEntry',
-      id: sameDay.metadata.id,
-      expectedResourceVersion: sameDay.metadata.resourceVersion,
-      spec: spec({ description: 'Same day', date: '2025-12-31', expenses: '6.00' }),
-      status: sameDay.status,
-      relationships: {},
-      transactionId: '33333333-3333-4333-8333-333333333333',
-    }).result;
-    assert.equal(moved.status.cashOnHand, '94.00');
-    assert.equal(moved.status.committedAt, null);
-    const recalculatedLater = service.get('LedgerEntry', later.metadata.id).result;
-    assert.equal(recalculatedLater.status.cashOnHand, '120.00');
-    assert.equal(recalculatedLater.metadata.resourceVersion, 1);
-    assert.equal(
-      store.database.prepare(
-        "SELECT count(*) AS count FROM data_change_log WHERE row_id = ? AND resolution IS NULL",
-      ).get(sameDay.metadata.id)!.count,
-      1,
-    );
-    assert.equal(
-      store.database.prepare(
-        'SELECT committed_at FROM data_change_log WHERE row_id = ? AND resolution IS NULL',
-      ).get(sameDay.metadata.id)!.committed_at,
-      firstCommittedAt,
-    );
-
-    service.discard([sameDay.metadata.id]);
-    const restored = service.get('LedgerEntry', sameDay.metadata.id).result;
-    assert.equal(restored.status.committedAt, new Date(Number(firstCommittedAt)).toISOString());
-    assert.equal(restored.spec.date, '2026-01-01');
-
-    service.delete({
-      kind: 'LedgerEntry',
-      id: opening.metadata.id,
-      expectedResourceVersion: opening.metadata.resourceVersion,
+    const transactions = service.createChangeSet('Transactions').result;
+    service.create({
+      kind: 'Transaction',
+      spec: { date: '2026-01-10', description: 'Deposit', amount: '250.00' },
+      relationships: {
+        fromAccountId: DEFAULT_IDS.receivableAccount,
+        toAccountId: DEFAULT_IDS.cashAccount,
+        budgetId: DEFAULT_IDS.uncategorizedBudget,
+        changeSetId: transactions.metadata.id,
+      },
     });
-    assert.equal(service.dirty().result.some((entry) => (
-      entry.metadata.id === opening.metadata.id && entry.status.deleted === true
-    )), true);
-    assert.throws(() => service.get('LedgerEntry', opening.metadata.id), /not found/);
-    assert.equal(service.get('LedgerEntry', later.metadata.id).result.status.cashOnHand, '26.00');
-    assert.equal(
-      store.database.prepare('SELECT deleted FROM ledger_entries WHERE id = ?').get(opening.metadata.id)!.deleted,
-      1,
+
+    service.commitChangeSet(transactions.metadata.id, transactions.metadata.resourceVersion);
+
+    const knownSet = service.createChangeSet('Known value').result;
+    const known = service.create({
+      kind: 'AccountKnownValue',
+      spec: { date: '2026-01-31', value: '1500.00', note: 'Portal balance' },
+      relationships: {
+        accountId: DEFAULT_IDS.cashAccount,
+        changeSetId: knownSet.metadata.id,
+      },
+    }).result;
+    service.commitChangeSet(knownSet.metadata.id, knownSet.metadata.resourceVersion);
+    const calculated = service.get('AccountKnownValue', known.metadata.id).result;
+    assert.equal(calculated.status.calculatedValue, '250.00');
+    assert.equal(calculated.status.unreconciledAmount, '1250.00');
+    assert.equal(calculated.status.severity, 'High');
+    const account = service.get('Account', DEFAULT_IDS.cashAccount).result;
+    assert.equal(account.status.directBalance, '1500.00');
+    assert.equal(account.status.unreconciledAmount, '1250.00');
+    const updated = service.update({
+      kind: 'AccountKnownValue',
+      id: calculated.metadata.id,
+      expectedResourceVersion: calculated.metadata.resourceVersion,
+      spec: { ...calculated.spec, value: '1600.00' },
+      status: calculated.status,
+      relationships: calculated.relationships,
+    }).result;
+    assert.equal(updated.status.state, 'Draft');
+    const pendingValue = service.query('AccountKnownValue', undefined).result.find(
+      (item) => item.metadata.id === calculated.metadata.id,
     );
+    assert.equal(pendingValue?.status.unreconciledAmount, '1350.00');
+    const updateSet = service.get('ChangeSet', String(updated.relationships.changeSetId)).result;
+    service.commitChangeSet(updateSet.metadata.id, updateSet.metadata.resourceVersion);
+    assert.equal(service.get('AccountKnownValue', calculated.metadata.id).result.spec.value, '1600.00');
+
+    const deleted = service.delete({
+      kind: 'AccountKnownValue',
+      id: calculated.metadata.id,
+      expectedResourceVersion: service.get('AccountKnownValue', calculated.metadata.id).result.metadata.resourceVersion,
+    }).result;
+    assert.equal(deleted.status.deleted, true);
+    const deleteSet = service.get('ChangeSet', String(deleted.relationships.changeSetId)).result;
+    service.commitChangeSet(deleteSet.metadata.id, deleteSet.metadata.resourceVersion);
+    assert.equal(service.query('AccountKnownValue', undefined).result.some(
+      (item) => item.metadata.id === calculated.metadata.id,
+    ), false);
   } finally {
     store.close();
   }
 });
 
-test('migrates the legacy dirty flag and restores its committed timestamp', () => {
+test('marks unreconciled amounts at exactly one thousand dollars as high severity', () => {
   const store = new ResourceStore(':memory:');
+  const service = new BankingResourceService(createRegistry(), store);
   try {
-    store.database.exec(`
+    const changeSet = service.createChangeSet('Known balance threshold').result;
+    service.create({
+      kind: 'AccountKnownValue',
+      spec: { date: '2026-01-01', value: '1000.00' },
+      relationships: {
+        accountId: DEFAULT_IDS.cashAccount,
+        changeSetId: changeSet.metadata.id,
+      },
+    });
+    service.commitChangeSet(changeSet.metadata.id, changeSet.metadata.resourceVersion);
+    const value = service.query('AccountKnownValue', undefined).result.find(
+      (item) => item.spec.date === '2026-01-01',
+    );
+    assert.equal(value?.status.unreconciledAmount, '1000.00');
+    assert.equal(value?.status.severity, 'High');
+  } finally {
+    store.close();
+  }
+});
+
+test('reconciles parent known values against descendant balances without double counting', () => {
+  const store = new ResourceStore(':memory:');
+  const service = new BankingResourceService(createRegistry(), store);
+  try {
+    const changeSet = service.createChangeSet('Parent reconciliation').result;
+    const child = service.create({
+      kind: 'Account',
+      spec: { name: 'Child cash', currency: 'USD', internal: true },
+      relationships: {
+        parentAccountId: DEFAULT_IDS.cashAccount,
+        changeSetId: changeSet.metadata.id,
+      },
+    }).result;
+    service.create({
+      kind: 'AccountKnownValue',
+      spec: { date: '2026-01-31', value: '1000.00' },
+      relationships: { accountId: child.metadata.id, changeSetId: changeSet.metadata.id },
+    });
+    const parentKnown = service.create({
+      kind: 'AccountKnownValue',
+      spec: { date: '2026-01-31', value: '1000.00' },
+      relationships: { accountId: DEFAULT_IDS.cashAccount, changeSetId: changeSet.metadata.id },
+    }).result;
+    service.commitChangeSet(changeSet.metadata.id, changeSet.metadata.resourceVersion);
+
+    const reconciliation = service.get('AccountKnownValue', parentKnown.metadata.id).result;
+    assert.equal(reconciliation.status.calculatedValue, '1000.00');
+    assert.equal(reconciliation.status.unreconciledAmount, '0.00');
+    const parent = service.get('Account', DEFAULT_IDS.cashAccount).result;
+    assert.equal(parent.status.directBalance, '0.00');
+    assert.equal(parent.status.descendantsBalance, '1000.00');
+    assert.equal(parent.status.totalBalance, '1000.00');
+  } finally {
+    store.close();
+  }
+});
+
+test('summarizes committed transactions by month and classification', () => {
+  const transactions = [{
+    kind: 'Transaction',
+    metadata: { id: '1', createdAt: '', updatedAt: '', resourceVersion: 1 },
+    spec: { date: '2026-01-01', description: 'Income', amount: '1000.00' },
+    status: { state: 'Committed', classification: 'Income' },
+    relationships: {},
+  }, {
+    kind: 'Transaction',
+    metadata: { id: '2', createdAt: '', updatedAt: '', resourceVersion: 1 },
+    spec: { date: '2026-01-02', description: 'Expense', amount: '250.00' },
+    status: { state: 'Committed', classification: 'Expense' },
+    relationships: {},
+  }];
+  assert.deepEqual(summarizeTransactions(transactions, '2026').total, {
+    income: '1000.00',
+    expense: '250.00',
+    operatingCashFlow: '750.00',
+    transactionCount: 2,
+  });
+});
+
+test('restores spreadsheet projection rows with historical running cash', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'banking-legacy-ledger-'));
+    const sourcePath = join(directory, 'legacy.sqlite');
+    const source = new DatabaseSync(sourcePath);
+    source.exec(`
       CREATE TABLE ledger_entries (
         id TEXT PRIMARY KEY,
         entry_at INTEGER NOT NULL,
         description TEXT NOT NULL,
         lifecycle_status TEXT NOT NULL,
-        revenue_cents INTEGER NOT NULL DEFAULT 0,
-        expenses_cents INTEGER NOT NULL DEFAULT 0,
-        reinvested_cents INTEGER NOT NULL DEFAULT 0,
+        revenue_cents INTEGER NOT NULL,
+        expenses_cents INTEGER NOT NULL,
+        reinvested_cents INTEGER NOT NULL,
         opening_cash_cents INTEGER,
-        note TEXT,
-        source_json TEXT,
-        dirty INTEGER NOT NULL DEFAULT 1 CHECK (dirty IN (0, 1)),
-        deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
-        resource_version INTEGER NOT NULL DEFAULT 1,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL
+        deleted INTEGER NOT NULL
       );
-      CREATE TABLE data_change_log (
+      CREATE TABLE resources (
         id TEXT PRIMARY KEY,
-        changed_at INTEGER NOT NULL,
-        table_name TEXT NOT NULL,
-        row_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        before_data TEXT,
-        after_data TEXT,
-        actor TEXT,
-        resolution TEXT,
-        resolved_at INTEGER,
-        commit_id TEXT
+        spec TEXT NOT NULL
       );
-      INSERT INTO ledger_entries VALUES (
-        'legacy', 1767225600000, 'Working value', 'Realized',
-        0, 0, 0, NULL, NULL, NULL, 1, 0, 2, 50, 200
+      CREATE TABLE ledger_items (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        from_account_id TEXT NOT NULL,
+        to_account_id TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        note TEXT,
+        created_at INTEGER NOT NULL
       );
-      INSERT INTO data_change_log
-        (id, changed_at, table_name, row_id, operation, before_data)
-      VALUES (
-        'legacy-log', 200, 'ledger_entries', 'legacy', 'update',
-        '{"id":"legacy","entry_at":1767225600000,"description":"Committed value","lifecycle_status":"Realized","revenue_cents":0,"expenses_cents":0,"reinvested_cents":0,"opening_cash_cents":null,"note":null,"source_json":null,"dirty":0,"deleted":0,"resource_version":1,"created_at":50,"updated_at":100}'
+      CREATE TABLE transaction_staging (
+        id TEXT PRIMARY KEY,
+        ledger_entry_id TEXT,
+        transaction_at INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        source_account TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_status TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at INTEGER NOT NULL
       );
+      INSERT INTO resources VALUES
+        ('cash', '{"name":"Cash","internal":true}'),
+        ('income-account', '{"name":"Salary Income","internal":false}'),
+        ('expense-account', '{"name":"Mortgage Expense","internal":false}');
     `);
+    const insert = source.prepare(`
+      INSERT INTO ledger_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run('opening', Date.parse('2025-12-31'), 'Opening', 'Realized', 0, 0, 0, 100000, 0);
+    insert.run('income', Date.parse('2026-01-15'), 'Salary', 'Realized', 25000, 0, 0, null, 0);
+    insert.run('expense', Date.parse('2026-02-01'), 'Mortgage', 'Planned', 0, 40000, 0, null, 0);
+    insert.run('deleted', Date.parse('2026-02-02'), 'Deleted', 'Realized', 10000, 0, 0, null, 1);
+    source.exec(`
+      INSERT INTO ledger_items VALUES
+        ('income-item', 'income', 'income-account', 'cash', 25000, NULL, 1),
+        ('expense-item', 'expense', 'cash', 'expense-account', 40000, 'Monthly payment', 2);
+      INSERT INTO transaction_staging VALUES
+        ('staged-expense', 'expense-item', 1769904000000, 'Mortgage payment', -40000,
+         'Checking', 'Mortgage', 'posted', 'Reconciled', 1);
+    `);
+    source.close();
+
+    const store = new ResourceStore(':memory:');
     const service = new BankingResourceService(createRegistry(), store);
-    assert.equal(
-      store.database.prepare(
-        "SELECT count(*) AS count FROM pragma_table_info('ledger_entries') WHERE name = 'dirty'",
-      ).get()!.count,
-      0,
-    );
-    assert.equal(
-      store.database.prepare('SELECT committed_at FROM ledger_entries WHERE id = ?').get('legacy')!.committed_at,
-      null,
-    );
-    assert.equal(
-      store.database.prepare('SELECT committed_at FROM data_change_log WHERE id = ?').get('legacy-log')!.committed_at,
-      100,
-    );
-    const restored = service.discard(['legacy']).result[0];
-    assert.equal(restored.spec.description, 'Committed value');
-    assert.equal(restored.status.committedAt, new Date(100).toISOString());
-  } finally {
-    store.close();
-  }
-});
-
-test('rejects invalid opening entries without partial resources or events', () => {
-  const { store, service } = setup();
-  try {
-    assert.throws(() => service.create({
-      kind: 'LedgerEntry',
-      spec: spec({ openingCashOnHand: '100.00', revenue: '1.00' }),
-    }), /zero revenue/);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM ledger_entries').get()!.count, 0);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM audit_events').get()!.count, 0);
-    assert.equal(store.database.prepare('SELECT count(*) AS count FROM domain_events').get()!.count, 0);
-  } finally {
-    store.close();
-  }
-});
-
-test('summarizes data-driven statuses and worksheet provenance', () => {
-  const entries = [
-    ['Realized', '1000.00', '250.00'],
-    ['Planned', '2000.00', '500.00'],
-    ['Estimated', '300.00', '450.00'],
-  ].map(([status, revenue, expenses], index) => ({
-    kind: 'LedgerEntry',
-    metadata: { id: String(index), createdAt: '', updatedAt: '', resourceVersion: 1 },
-    spec: {
-      status,
-      revenue,
-      expenses,
-      reinvested: '0.00',
-      date: status === 'Estimated' ? '2025-09-15' : '2026-01-01',
-      description: status,
-      source: status === 'Estimated'
-        ? { system: 'xlsx-import', worksheet: '2026 Ledger', row: '102' }
-        : undefined,
-    },
-    status: { cashDelta: '0.00', operatingCashFlow: '0.00', cashOnHand: '0.00' },
-    relationships: {},
-  }));
-  const summary = summarizeLedger(entries, '2026');
-  assert.deepEqual(summary.groups.map(({ status, revenue, expenses, operatingCashFlow }) => ({
-    status, revenue, expenses, operatingCashFlow,
-  })), [
-    { status: 'Realized', revenue: '1000.00', expenses: '250.00', operatingCashFlow: '750.00' },
-    { status: 'Planned', revenue: '2000.00', expenses: '500.00', operatingCashFlow: '1500.00' },
-    { status: 'Estimated', revenue: '300.00', expenses: '450.00', operatingCashFlow: '-150.00' },
-  ]);
-  assert.deepEqual(summary.total, {
-    revenue: '3300.00',
-    expenses: '1200.00',
-    operatingCashFlow: '2100.00',
-    activeEntryCount: 3,
-  });
+    try {
+      assert.deepEqual(service.importLegacyProjection(sourcePath).result, {
+        imported: 3,
+        total: 3,
+      });
+      assert.deepEqual(service.importLegacyProjection(sourcePath).result, {
+        imported: 0,
+        total: 3,
+      });
+      assert.deepEqual(service.ledger({
+        from: '2026-01-01',
+        through: '2026-12-31',
+      }).result.map((row) => ({
+        id: row.id,
+        status: row.status,
+        description: row.description,
+        date: row.date,
+        fromAccount: row.fromAccount,
+        toAccount: row.toAccount,
+        amount: row.amount,
+        flow: row.flow,
+        note: row.note,
+        staging: row.staging,
+        revenue: row.revenue,
+        expenses: row.expenses,
+        cashOnHand: row.cashOnHand,
+        sourceKind: row.sourceKind,
+      })), [{
+        id: 'projection-item:expense-item',
+        status: 'Planned',
+        description: 'Mortgage',
+        date: '2026-02-01',
+        fromAccount: 'Cash',
+        toAccount: 'Mortgage Expense',
+        amount: '400.00',
+        flow: 'Expense',
+        note: 'Monthly payment',
+        staging: [{
+          date: '2026-02-01',
+          description: 'Mortgage payment',
+          amount: '400.00',
+          sourceAccount: 'Checking',
+          sourceType: 'Mortgage',
+          sourceStatus: 'posted',
+          state: 'Reconciled',
+        }],
+        revenue: '0.00',
+        expenses: '400.00',
+        cashOnHand: '850.00',
+        sourceKind: 'Projection',
+      }, {
+        id: 'projection-item:income-item',
+        status: 'Realized',
+        description: 'Salary',
+        date: '2026-01-15',
+        fromAccount: 'Salary Income',
+        toAccount: 'Cash',
+        amount: '250.00',
+        flow: 'Income',
+        note: undefined,
+        staging: [],
+        revenue: '250.00',
+        expenses: '0.00',
+        cashOnHand: '1250.00',
+        sourceKind: 'Projection',
+      }]);
+      assert.deepEqual(service.ledger({
+        status: 'Not realized',
+        search: 'mort',
+      }).result.map((row) => row.description), ['Mortgage']);
+      const updated = service.updateLedgerItem({
+        id: 'projection-item:expense-item',
+        amount: '400.01',
+        description: 'Updated mortgage',
+        status: 'Estimated',
+        actor: 'ledger-test',
+      }).result;
+      assert.equal(updated.amount, '400.01');
+      assert.equal(updated.description, 'Updated mortgage');
+      assert.equal(updated.status, 'Estimated');
+      assert.equal(updated.cashOnHand, '849.99');
+      assert.equal(
+        service.ledger().result.some((row) => row.id === 'projection-adjustment:expense'),
+        false,
+      );
+      const event = store.database.prepare(`
+        SELECT event_type, resource_kind, resource_id
+        FROM domain_events
+        WHERE resource_id = 'projection-item:expense-item'
+      `).get() as Record<string, unknown>;
+      assert.equal(event.event_type, 'LedgerItem.updated');
+      assert.equal(event.resource_kind, 'LedgerItem');
+      assert.equal(event.resource_id, 'projection-item:expense-item');
+      assert.throws(() => service.ledger({
+        from: '2026-03-01',
+        through: '2026-02-01',
+      }), /from cannot be after through/);
+    } finally {
+      store.close();
+      rmSync(directory, { recursive: true });
+    }
 });

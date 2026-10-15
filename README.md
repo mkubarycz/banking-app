@@ -1,14 +1,13 @@
 # Banking App
 
-A durable personal ledger with exact balances and budget pacing. This is an
-independent Cruft-managed application data plane: it owns SQLite persistence,
-resource schemas, audit/domain events, MCP and HTTP APIs, the dashboard,
-health, and its Docker image. Working Memory is an optional launcher and
-contract-first client.
+Banking App 1.2 is a transaction, planning, and account-reconciliation
+workspace. It owns its SQLite data, audit/domain events,
+HTTP API, MCP server, responsive web UI, and Docker image. Working Memory can
+launch it and manipulate the same contract through MCP.
 
-## Start and use
+## Run
 
-Local Node development (Node 22+):
+Node 22 or newer is required.
 
 ```sh
 npm ci
@@ -18,120 +17,242 @@ npm run build
 DATABASE_PATH=./banking-app.sqlite npm start
 ```
 
-Containerized:
+Container:
 
 ```sh
 docker compose build
 docker compose up -d
 curl http://127.0.0.1:4174/health
 open http://127.0.0.1:4174/
-docker compose down
 ```
 
-Compose publishes only `127.0.0.1:4174` and uses the named persistent volume
-`working-memory-banking-app-data`. The production database starts empty.
+Compose publishes only `127.0.0.1:4174` and stores SQLite data in the
+`working-memory-banking-app-data` volume.
 
-Endpoints:
+## Model
 
-- UI: `http://127.0.0.1:4174/`
-- health: `GET /health`
-- MCP Streamable HTTP: `/mcp`
-- discovery: `GET /.well-known/banking-app-contract` or `GET /api/contract`
-- resources: `GET|POST /api/resources/LedgerEntry` and
-  `GET|PUT|DELETE /api/resources/LedgerEntry/:id`
-- dirty changes: `GET /api/ledger/dirty`
-- commit: `POST /api/ledger/commit` with `{ "ids": ["..."] }`
-- discard: `POST /api/ledger/discard` with `{ "ids": ["..."] }`
-- dashboard: `GET /api/dashboard?year=2026`
-
-Send `x-transaction-id: <uuid>` over HTTP or `transactionId` through MCP to
-correlate writes. Updates and deletes require `expectedResourceVersion`.
-
-## Published LedgerEntry shape
-
-The generic envelope is `{ kind, metadata, spec, status, relationships }`.
-`metadata.id` is an application-generated stable UUID.
+Every resource uses:
 
 ```json
 {
-  "kind": "LedgerEntry",
-  "spec": {
-    "status": "Realized",
-    "description": "Consulting payment",
-    "date": "2026-01-15",
-    "revenue": "1250.00",
-    "expenses": "0.00",
-    "reinvested": "250.00",
-    "note": "Optional",
-    "source": {
-      "system": "manual",
-      "document": "Optional provenance",
-      "worksheet": "Optional provenance",
-      "row": "Optional provenance"
-    }
+  "kind": "Transaction",
+  "metadata": {
+    "id": "uuid",
+    "createdAt": "ISO-8601",
+    "updatedAt": "ISO-8601",
+    "resourceVersion": 1
   },
-  "status": {
-    "cashDelta": "1000.00",
-    "operatingCashFlow": "1250.00",
-    "cashOnHand": "1000.00",
-    "dirty": true,
-    "committedAt": null,
-    "deleted": false,
-    "previousSpec": null
-  },
+  "spec": {},
+  "status": {},
   "relationships": {}
 }
 ```
 
-Money is published as a canonical signed decimal **string** with exactly two
-fractional digits and stored as integer cents. JSON numeric money is rejected.
+The registered resource kinds are:
 
-`cashDelta = revenue - expenses - reinvested`; `operatingCashFlow = revenue -
-expenses`. Entries use an internal UTC millisecond timestamp for ordering while
-the external contract displays only the date. The first entry may include
-`openingCashOnHand` when all three flow amounts are zero. Cash calculations are
-produced after retrieval and are not persisted.
+- **Account** — a node in a user-controlled hierarchy. Both parents and leaves
+  may receive transactions. Responses derive `directBalance`,
+  `descendantsBalance`, and `totalBalance`.
+- **Budget** — a separate planning hierarchy with one Budgeted Value per
+  occurrence plus an Income, Expense, or Reinvested flow. Calendar recurrence
+  uses RFC 5545-style rules: monthly day lists (including `-1` for the last day)
+  or `FREQ=WEEKLY;INTERVAL=2` behavior anchored by a first occurrence. The app
+  derives monthly Budgeted totals over the selected start/end dates and rolls
+  them through parent Budgets alongside Realized transaction totals. Derived
+  `balance` and cumulative `balanceByMonth` values represent disbursements
+  minus assigned Transactions.
+- **Transaction** — one date, description, positive amount, From account, To
+  account, and Budget. There are no split transactions or persisted groups.
+- **AccountKnownValue** — a dated observation of one account's balance. A leaf
+  observation anchors its direct balance; a parent observation reconciles its
+  direct activity together with all descendant balances.
+  Account-detail add, correction, and deletion controls stage an atomic Change
+  Set. Pending observations appear in the timeline with the standard red
+  commit bar; double-clicking only that bar commits them.
+- **ChangeSet** — an atomic unit of staged creates, updates, deletes, imports,
+  and reconciliation proposals.
 
-Creates, edits, soft deletes, and restores are immediately visible working
-changes with `committed_at = NULL`. There is no stored dirty flag; the external
-`dirty` status is derived from that null timestamp. The first committed-to-
-uncommitted transition stores one complete baseline and its prior commit time
-in `data_change_log`; later edits reuse it. Commit records the final row and
-sets `committed_at` to the current time. Revert restores both the baseline and
-its prior commit time. Deletes set `deleted` and never physically remove a
-ledger row. Normal queries omit deleted rows.
-The ledger header reports the dirty-row count and links to a dirty-only view,
-including proposed deletions. Hovering a dirty row reveals its committed values
-in an aligned row underneath, where the user can revert to that baseline. The
-final column uses the self-hosted `timeago.js` package to show the live relative
-commit time for clean rows, Commit for dirty current rows, and Revert for prior
-rows. Times under one minute read `Just now`, then advance through minutes,
-hours, and days without a page reload. Times older than seven days display their
-calendar date. Delete is available from the row's gear menu, which appears at
-the far left on hover.
-Lifecycle labels are required but open-ended; Realized, Planned, and Estimated
-are initial common values rather than an enum.
+Money is represented as a canonical decimal string with exactly two
+fractional digits and persisted/calculated as integer cents.
 
-## Working Memory
+### Classification
 
-Working Memory registers the app as `@banking-app`, launches container
-`working-memory-banking-app`, and mounts independent volume
-`working-memory-banking-app-data`. Select Banking App in Container Apps or
-mention `@banking-app`; the chat agent discovers `contract-discover` before
-using generic resource tools.
+Only the Account `internal` boundary has accounting semantics:
 
-## Cruft updates and ownership
+- External → Internal: Income
+- Internal → External: Expense
+- Internal → Internal: Transfer
+- External → External: Transfer
 
-Provenance is pinned in `.cruft.json` to Working Memory commit `9d37a29`,
-subdirectory `templates/standalone-app`. Framework/runtime surfaces remain
-template-owned. Banking domain definitions, policies, UI, and tests are
-app-owned under `src/app/**` and `test/app/**` and are the only skipped paths.
+### Known values and reconciliation
 
-From the Banking App directory:
+A committed leaf known value anchors its selected account's direct balance.
+For a parent Account, the calculated value includes direct activity plus every
+descendant Account, and the anchor applies to that combined total.
+The application calculates forward from the latest anchor using committed
+transactions. At each known value it publishes:
+
+- observed value
+- calculated pre-adjustment value
+- virtual unreconciled amount
+- severity (`High` when the absolute unreconciled amount is at least $1,000)
+
+The unreconciled amount is display-only and is never persisted as a
+transaction. It appears directly on the Accounts hierarchy; `$0.00` is green,
+and clicking any amount opens the underlying known value.
+Parent account totals combine each account's anchored/calculated direct value
+with its descendants.
+
+### Change Sets
+
+Single resource mutations automatically create their own Change Set. For an
+atomic multi-resource operation, create one Change Set first and include its ID
+as `relationships.changeSetId` on every grouped create or update. Omitting that
+relationship creates a separate Change Set. Agents must not commit or discard a
+Change Set unless the user explicitly requests that lifecycle operation; normal
+work leaves correct changes staged for UI approval.
+
+Interactive resource mutations are staged. Account display ordering and
+deterministic source imports apply immediately. The default staged lifecycle is:
+
+`Open → Committed` or `Open → Discarded`
+
+Open Change Sets are prospective: their effective draft resource values drive
+Account balances, unreconciled amounts, ledger projections, dashboards, and
+Realized Budget totals until the Change Set is committed or discarded. Staging
+a metadata-only Transaction edit such as a Budget assignment must never remove
+that Transaction from financial calculations.
+
+Commit validates and applies every item atomically. Discard removes newly
+created resources and restores the first baseline of updated/deleted resources.
+Every write also produces audit and domain events. Updates and deletes require
+`expectedResourceVersion` compare-and-swap protection.
+
+## Import and reimport
+
+Set `TRANSACTION_IMPORT_PATH` to a directory containing supported Merrill
+activity CSVs and Bank of America aggregate exports. Startup imports are
+idempotent. Zero-dollar rows are ignored, Merrill rows in aggregate exports
+are excluded, and source fingerprints remain stable.
+
+Imported rows become committed native `Transaction` resources immediately.
+Each Transaction retains its source status, type, account, file, and stable
+fingerprint. Positive rows flow from external `Uncategorized Income` into the
+source account; negative rows flow from the source account to external
+`Uncategorized Expense`. All imported rows use the Uncategorized Budget until
+they are edited.
+
+The 2026-10-11 account balance snapshot is loaded as committed
+`AccountKnownValue` resources. Snapshot accounts without transaction activity
+are still created; imported accounts without supplied balances remain
+unanchored.
+
+Banking App performs a one-time clean migration from the previous projection
+workspace. It removes the old Account, Transaction, Staged Transaction,
+projection, and Change Set data before rebuilding Accounts and Transactions
+from the current snapshot and source files. Use reset and reimport during
+development to reproduce the source-backed data:
 
 ```sh
-../working-memory/scripts/cruft.sh check
-../working-memory/scripts/cruft.sh update --template-path ../working-memory
+curl -X POST http://127.0.0.1:4174/api/reset
+curl -X POST -H 'content-type: application/json' \
+  -d '{"reset":false}' http://127.0.0.1:4174/api/reimport
 ```
 
-Review every update diff. Do not use `--skip-update` to hide framework drift.
+`/api/reimport` reads only the server-configured `TRANSACTION_IMPORT_PATH`.
+
+## HTTP and MCP
+
+Discovery:
+
+- `GET /health`
+- `GET /api/contract`
+- `GET /.well-known/banking-app-contract`
+- MCP Streamable HTTP at `/mcp`
+
+Resources:
+
+- `GET|POST /api/resources/:kind`
+- `GET|PUT|DELETE /api/resources/:kind/:id`
+
+Workflows:
+
+- `POST /api/change-sets`
+- `POST /api/change-sets/:id/commit`
+- `POST /api/change-sets/:id/discard`
+- `POST /api/reset`
+- `POST /api/reimport`
+- `GET /api/pending-changes` to list pending resources and fields changed from
+  their committed baselines
+- `GET|PUT /api/account-order` to read or immediately update Account sibling
+  display order without a Change Set
+- `GET /api/change-version`
+- `GET /api/dashboard?year=2026`
+
+MCP exposes equivalent resource, Change Set, reset, and import tools.
+Dragged Transaction references resolve through `resource-get` and change
+through `resource-update`. Call `contract-discover` before mutations. Supply
+`transactionId` through MCP or `x-transaction-id` over HTTP to correlate
+writes.
+
+`GET /api/change-version` is a lightweight host-integration signal. The web UI
+polls it and refreshes after MCP or API mutations.
+
+## UI
+
+The UI provides:
+
+- a month-grouped native Transaction list with date, description, source
+  provenance, route, classification, and amount
+- a consistent pending-change treatment across resource views: an 8px red left
+  bar identifies pending rows, red values identify fields that differ from
+  committed data, and double-clicking only the red bar commits the associated
+  atomic Change Set
+- draggable Transactions that emit Working Memory's versioned
+  Container App resource-reference JSON with date, description, amount, stable
+  app/resource identity, and a loopback deep link
+- drag-and-drop Account and Budget trees
+- immediate Account ordering stored separately from staged Account resources;
+  changing an Account parent remains an atomic Change Set edit
+- separate direct, descendant, and total Account balances
+- Account detail balance history with a dated timeline, pointer-centered
+  mouse-wheel zoom, double-click month zoom, reset, and synchronized
+  graph/Transaction highlighting
+- stacked balance-history area lines for parent Accounts, showing how direct and
+  child-account balances compose and carry the total forward over time, with
+  clickable transaction dots linked to activity rows
+- parent Account activity tables that include all descendant transactions and
+  virtual adjustments, prefixing routes with the participating child Account;
+  every Account in a route links to its Account detail page
+- draggable Account rows that emit the same versioned Working Memory resource
+  reference payload and deep link as draggable Transactions
+- Account-detail known-value add/edit dialogs, including deletion and virtual
+  adjustment notes that show the observed amount and date
+- perfect-reconciliation badges on the latest transaction at or before a
+  fully reconciled known value, with a green balance and direct access to the
+  known-value editor
+- a signed, clickable Unreconciled column on the Accounts hierarchy, with
+  green `$0.00` balances and observed/ledger/date details on hover
+- paste-friendly date fields that normalize common US, ISO, and month-name
+  dates to the canonical `YYYY-MM-DD` format before submission
+- calendar-derived monthly Budgeted and Realized Budget rollups
+- Account-style Budget detail pages with Back navigation, autosaved inline
+  recurrence editing, pending-change highlighting and Commit actions, and
+  descendant-aware Transaction tables
+- full-calendar-year Budget balance charts where recurrence disbursements add
+  funds, assigned Transactions subtract funds, and every dated event is a dot
+- a default five-day Settled balance view that nets short-lived disbursement
+  spikes while retaining a Raw balance toggle and both values in event tooltips
+- an explicit zero-balance reference line and future Estimated payment events
+  equal to each remaining scheduled Budget occurrence
+- Budget Transaction tables with the balance immediately after each row
+- shared Account/Budget timeline interactions: wheel zoom, month zoom on
+  double-click, reset controls, and transaction-dot hover/click highlighting
+- month-grouped Transaction views with the assigned Budget in the grid and a
+  title-click Transaction details popout for editing Date, Description, Amount,
+  From Account, To Account, and Budget
+- searchable account and budget mapping inputs
+- dated known-value entry and virtual unreconciled-amount review
+- an always-visible Change Set approval/discard rail
+
+Persisted transaction groups and Account Categories no longer exist.
